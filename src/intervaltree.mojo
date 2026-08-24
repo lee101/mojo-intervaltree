@@ -40,6 +40,17 @@ def mit_build_index(
     var order = IPtr(unsafe_from_address=order_addr)
     var stack = IPtr(unsafe_from_address=stack_addr)
 
+    comptime W = simdwidthof[DType.float64]()
+    var i = 0
+    while i + W <= n:
+        left.store(i, SIMD[DType.int64, W](-1))
+        right.store(i, SIMD[DType.int64, W](-1))
+        i += W
+    while i < n:
+        left[i] = -1
+        right[i] = -1
+        i += 1
+
     var top = 1
     var next_node = 0
     stack[0] = 0
@@ -60,8 +71,6 @@ def mit_build_index(
         begins[node] = source_begins[source]
         ends[node] = source_ends[source]
         order[node] = Int64(source)
-        left[node] = -1
-        right[node] = -1
         if parent >= 0:
             if is_right:
                 right[parent] = Int64(node)
@@ -83,8 +92,7 @@ def mit_build_index(
             stack[base + 3] = 0
             top += 1
 
-    comptime W = simdwidthof[DType.float64]()
-    var i = 0
+    i = 0
     while i + W <= n:
         max_ends.store(i, ends.load[width=W](i))
         i += W
@@ -120,6 +128,7 @@ def query(
     result: IPtr,
     result_base: Int,
     stack: IPtr,
+    write_results: Bool,
 ) -> Int:
     if n == 0:
         return 0
@@ -135,7 +144,8 @@ def query(
                 continue
             if begins[node] <= lower:
                 if lower < ends[node]:
-                    result[result_base + count] = order[node]
+                    if write_results:
+                        result[result_base + count] = order[node]
                     count += 1
                 var l = Int(left[node])
                 if l >= 0:
@@ -157,7 +167,8 @@ def query(
                 continue
             if begins[node] < upper:
                 if ends[node] > lower:
-                    result[result_base + count] = order[node]
+                    if write_results:
+                        result[result_base + count] = order[node]
                     count += 1
                 var l = Int(left[node])
                 if l >= 0:
@@ -186,7 +197,8 @@ def query(
                 top += 1
         else:
             if ends[node] <= upper:
-                result[result_base + count] = order[node]
+                if write_results:
+                    result[result_base + count] = order[node]
                 count += 1
             var l = Int(left[node])
             if l >= 0:
@@ -236,6 +248,7 @@ def mit_query_one(
         IPtr(unsafe_from_address=result_addr),
         0,
         IPtr(unsafe_from_address=stack_addr),
+        True,
     )
 
 
@@ -278,19 +291,8 @@ def mit_count_many(
     var stack = IPtr(unsafe_from_address=stack_addr)
     for i in range(q):
         counts[i] = Int64(query(
-            begins,
-            ends,
-            max_ends,
-            left,
-            right,
-            order,
-            n,
-            kind,
-            lowers[i],
-            uppers[i],
-            result,
-            0,
-            stack,
+            begins, ends, max_ends, left, right, order, n, kind,
+            lowers[i], uppers[i], result, 0, stack, False,
         ))
     return 0
 
@@ -334,18 +336,7 @@ def mit_fill_many(
     var stack = IPtr(unsafe_from_address=stack_addr)
     for i in range(q):
         _ = query(
-            begins,
-            ends,
-            max_ends,
-            left,
-            right,
-            order,
-            n,
-            kind,
-            lowers[i],
-            uppers[i],
-            result,
-            Int(offsets[i]),
-            stack,
+            begins, ends, max_ends, left, right, order, n, kind,
+            lowers[i], uppers[i], result, Int(offsets[i]), stack, True,
         )
     return 0

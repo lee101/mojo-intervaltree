@@ -133,6 +133,16 @@ def test_native_index_simd_tail_and_duplicate_boundaries():
             assert_same(ours.envelop(begin, begin + 6), ref.envelop(begin, begin + 6))
 
 
+def test_batch_queries_cross_parallel_threshold():
+    rng = np.random.default_rng(11)
+    values = [(index * 3, index * 3 + 7, index) for index in range(3000)]
+    ours, ref = paired(values)
+    points = rng.integers(-10, 9010, size=4097, dtype=np.int64)
+    actual = ours.at_many(points)
+    for answer, point in zip(actual, points):
+        assert_same(answer, ref.at(int(point)))
+
+
 def test_coordinates_reject_unsafe_float64_narrowing_and_nonfinite_values():
     tree = IntervalTree.from_tuples([(0, 10)])
     unsafe_integer = 2**53 + 1

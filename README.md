@@ -58,14 +58,17 @@ suite.
 
 | case | mojo-intervaltree | intervaltree 3.1.0 | ratio |
 | --- | ---: | ---: | ---: |
-| build/index 200k intervals | 1370.43 ms | 6279.67 ms | 4.58x faster |
-| 20k point queries | 585.08 ms | 1170.96 ms | 2.00x faster |
-| 5k overlap queries | 293.37 ms | 6426.42 ms | 21.91x faster |
-| 5k envelop queries | 177.16 ms | 6975.61 ms | 39.38x faster |
+| build/index 200k intervals | 566.74 ms | 3970.44 ms | 7.01x faster |
+| 20k point queries | 220.47 ms | 821.39 ms | 3.73x faster |
+| 5k overlap queries | 122.73 ms | 4585.07 ms | 37.36x faster |
+| 5k envelop queries | 68.46 ms | 4424.77 ms | 64.63x faster |
 
 These are best-of-five timings except construction, which is best-of-three.
 They are measurements from this machine, not portable performance guarantees.
-There is no GPU path.
+There is no GPU path. Tree traversal is branch-heavy and loads several node
+arrays for only a few comparisons, so its arithmetic intensity is well below
+the roughly two-flops-per-byte threshold where transfer and launch overhead can
+be justified.
 
 ## How it works
 
@@ -76,15 +79,19 @@ end coordinate, allowing the Mojo traversal to prune subtrees that cannot
 overlap a query.
 
 Index construction sorts coordinates in NumPy, then builds the balanced topology
-and subtree maxima in Mojo. The contiguous maximum-end initialization uses
-native-width SIMD with a scalar tail. The topology has serial parent-child
+and subtree maxima in Mojo. Child-link and maximum-end initialization use
+native-width SIMD with scalar tails. The topology has serial parent-child
 dependencies, so it does not use a parallel path.
 
 Arrays cross the C ABI as integer addresses and are reconstructed as
 `UnsafePointer[..., AnyOrigin[mut=True]]` inside the exported Mojo functions.
-The Mojo library never allocates or owns Python memory. Batch queries use one
-counting pass, one exactly-sized result allocation, and one filling pass; the
-returned integer IDs are mapped back to the original Python `Interval` objects,
-so arbitrary data payloads remain in Python.
+The Mojo library never allocates or owns Python memory. Compatible float64 query
+arrays remain zero-copy across the FFI boundary, while other numeric NumPy
+buffers are validated and converted with vectorized NumPy operations. Batch
+queries use one count-only pass, one exactly-sized result allocation, and one
+filling pass. Point batches of at least 4,096 queries are split across up to
+eight CPU workers with disjoint scratch and output regions; smaller batches stay
+serial. Returned integer IDs are mapped back to the original Python `Interval`
+objects, so arbitrary data payloads remain in Python.
 
 Licensed under the MIT License. See `LICENSE`.

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor
 from numbers import Integral, Real
 from operator import attrgetter
 
@@ -13,6 +15,9 @@ from .interval import Interval
 
 
 class IntervalTree:
+    _parallel_query_threshold = 4096
+    _max_query_workers = 8
+
     __slots__ = (
         "_intervals",
         "_dirty",
@@ -52,6 +57,19 @@ class IntervalTree:
 
     @staticmethod
     def _coordinate(value):
+        value_type = type(value)
+        if value_type is float:
+            if not math.isfinite(value):
+                raise ValueError("coordinates must be finite")
+            return value
+        if value_type is int:
+            try:
+                converted = float(value)
+            except OverflowError as exc:
+                raise ValueError("coordinate is not representable as float64") from exc
+            if not math.isfinite(converted) or int(converted) != value:
+                raise ValueError("coordinate is not exactly representable as float64")
+            return converted
         if not isinstance(value, Real):
             raise TypeError("Mojo interval queries require real-number coordinates")
         try:
@@ -75,6 +93,15 @@ class IntervalTree:
             raise ValueError("query coordinates must be 1D arrays")
         if raw.dtype == np.float64 and raw.flags.c_contiguous:
             converted = raw
+        elif raw.dtype.kind in "iuf":
+            converted = np.ascontiguousarray(raw, dtype=np.float64)
+            if raw.dtype.kind in "iu":
+                with np.errstate(invalid="ignore", over="ignore"):
+                    exact = np.array_equal(converted.astype(raw.dtype), raw)
+            else:
+                exact = bool(np.all(raw == converted))
+            if not exact:
+                raise ValueError("coordinate is not exactly representable as float64")
         else:
             converted = np.ascontiguousarray(
                 [cls._coordinate(value) for value in raw], dtype=np.float64
@@ -229,7 +256,7 @@ class IntervalTree:
 
     def _query_many(self, kind, lowers, uppers):
         lower = self._coordinate_array(lowers)
-        upper = self._coordinate_array(uppers)
+        upper = lower if uppers is lowers else self._coordinate_array(uppers)
         if lower.ndim != 1 or upper.ndim != 1 or lower.shape != upper.shape:
             raise ValueError("query coordinates must be equal-length 1D arrays")
         q = lower.size
@@ -247,6 +274,12 @@ class IntervalTree:
         n = len(self._records)
         if n == 0:
             return [set() for _ in range(q)]
+        stack_stride = n.bit_length() + 1
+        parallel = kind == 0 and q >= self._parallel_query_threshold
+        workers = min(self._max_query_workers, q) if parallel else 1
+        stack_size = workers * stack_stride
+        if self._stack.size < stack_size:
+            self._stack = np.empty(stack_size, dtype=np.int64)
         counts = np.empty(q, dtype=np.int64)
         native = lib()
         common = (
@@ -262,36 +295,64 @@ class IntervalTree:
             addr(upper, np.float64),
             q,
         )
-        status = native.mit_count_many(
-            *common,
-            addr(counts, np.int64, writable=True),
-            addr(self._result, np.int64, writable=True),
-            addr(self._stack, np.int64, writable=True),
-        )
-        if status != 0:
-            raise RuntimeError(f"native batch count failed with status {status}")
-        if np.any(counts < 0) or np.any(counts > n):
-            raise RuntimeError("native batch count returned an invalid result size")
-        offsets = np.empty(q + 1, dtype=np.int64)
-        offsets[0] = 0
-        np.cumsum(counts, out=offsets[1:])
-        result = np.empty(int(offsets[-1]), dtype=np.int64)
-        if result.size:
-            status = native.mit_fill_many(
-                *common,
-                addr(offsets, np.int64),
-                addr(result, np.int64, writable=True),
-                addr(self._stack, np.int64, writable=True),
-            )
-            if status != 0:
-                raise RuntimeError(f"native batch fill failed with status {status}")
+        executor = ThreadPoolExecutor(max_workers=workers) if parallel else None
+
+        def run_chunks(function, output, *, offsets_array=None):
+            def run(worker):
+                first = worker * q // workers
+                last = (worker + 1) * q // workers
+                chunk_common = common[:8] + (
+                    addr(lower[first:last], np.float64),
+                    addr(upper[first:last], np.float64),
+                    last - first,
+                )
+                tail = (
+                    addr(offsets_array[first:last], np.int64)
+                    if offsets_array is not None
+                    else addr(output[first:last], np.int64, writable=True)
+                )
+                return function(
+                    *chunk_common,
+                    tail,
+                    addr(self._result if offsets_array is None else output, np.int64, writable=True),
+                    addr(
+                        self._stack[
+                            worker * stack_stride : (worker + 1) * stack_stride
+                        ],
+                        np.int64,
+                        writable=True,
+                    ),
+                )
+
+            if workers == 1:
+                return [run(0)]
+            return list(executor.map(run, range(workers)))
+
+        try:
+            statuses = run_chunks(native.mit_count_many, counts)
+            if any(status != 0 for status in statuses):
+                raise RuntimeError(f"native batch count failed with status {statuses}")
+            if np.any(counts < 0) or np.any(counts > n):
+                raise RuntimeError("native batch count returned an invalid result size")
+            offsets = np.empty(q + 1, dtype=np.int64)
+            offsets[0] = 0
+            np.cumsum(counts, out=offsets[1:])
+            result = np.empty(int(offsets[-1]), dtype=np.int64)
+            if result.size:
+                statuses = run_chunks(
+                    native.mit_fill_many, result, offsets_array=offsets
+                )
+                if any(status != 0 for status in statuses):
+                    raise RuntimeError(f"native batch fill failed with status {statuses}")
+        finally:
+            if executor is not None:
+                executor.shutdown()
         return [
             {self._records[int(i)] for i in result[offsets[j] : offsets[j + 1]]}
             for j in range(q)
         ]
 
     def at_many(self, points):
-        points = self._coordinate_array(points)
         return self._query_many(0, points, points)
 
     def overlap_many(self, begins, ends):
